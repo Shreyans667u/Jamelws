@@ -1,0 +1,358 @@
+name: Build James APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Write project files
+        run: |
+          mkdir -p src/main/java/com/orin/james
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "james"
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2"
+              id("org.jetbrains.kotlin.android") version "1.9.24"
+          }
+          android {
+              namespace = "com.orin.james"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.orin.james"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          cat > src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <queries>
+                  <intent><action android:name="android.speech.RecognitionService"/></intent>
+              </queries>
+              <application android:label="James" android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".JamesService" android:exported="false"
+                      android:foregroundServiceType="microphone"/>
+              </application>
+          </manifest>
+          EOF
+          cat > src/main/java/com/orin/james/Brain.kt <<'EOF'
+          package com.orin.james
+
+          import android.content.Context
+          import android.content.Intent
+          import android.net.Uri
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          class Reply(val text: String, val after: (() -> Unit)? = null)
+
+          class Brain(private val ctx: Context) {
+              private val p = ctx.getSharedPreferences("james", Context.MODE_PRIVATE)
+              private fun facts() = p.getString("facts", "")!!.split("\n").filter { it.isNotBlank() }
+              private fun name() = p.getString("name", "")!!
+              private fun who() = name().ifBlank { "genius" }
+
+              fun wake() = listOf(
+                  "Oh, so now you need me?", "What now, ${who()}?",
+                  "I was napping. Go on.", "Ugh. Yes? Speak."
+              ).random()
+
+              private fun go(i: Intent) {
+                  try { ctx.startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) } catch (e: Exception) {}
+              }
+
+              private fun openAssistant() {
+                  try {
+                      ctx.startActivity(Intent(Intent.ACTION_VOICE_COMMAND).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                  } catch (e: Exception) {
+                      go(Intent(Intent.ACTION_ASSIST))
+                  }
+              }
+
+              fun reply(raw: String): Reply {
+                  val s = raw.lowercase().trim().trimEnd('.', ',', '!', '?')
+
+                  Regex("^(?:remember|memorize|save|note)(?: that)? (.+)").find(s)?.let {
+                      p.edit().putString("facts", (facts() + it.groupValues[1]).joinToString("\n")).apply()
+                      return Reply(listOf(
+                          "Fine, I'll remember it. Unlike you, I actually can.",
+                          "Saved. Try not to forget you told me.",
+                          "Got it. Filed under things you'll ask me again."
+                      ).random())
+                  }
+                  Regex("my name is (\\w+)").find(s)?.let {
+                      val n = it.groupValues[1]
+                      p.edit().putString("name", n).apply()
+                      return Reply("$n. Hm. I've heard worse. Barely.")
+                  }
+                  if (Regex("what (do|did) you (remember|know)|recall").containsMatchIn(s)) {
+                      val parts = (if (name().isNotBlank()) listOf("your name is ${name()}") else listOf()) + facts()
+                      return if (parts.isEmpty()) Reply("You've told me nothing. Zero. Nada.")
+                      else Reply("Since you asked, " + parts.joinToString(". Also, ") + ".")
+                  }
+                  if (Regex("(forget|erase|clear) (everything|all|memory)").containsMatchIn(s)) {
+                      p.edit().clear().apply()
+                      return Reply("Wiped. Everything. Happy now?")
+                  }
+                  if (Regex("what('s| is) my name").containsMatchIn(s))
+                      return Reply(if (name().isNotBlank()) "${name()}. Wow, a memory test. Cute." else "You never told me. Rude.")
+                  if (Regex("\\btime\\b").containsMatchIn(s)) {
+                      val t = SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date())
+                      return Reply("It's $t. Do you not own a watch?")
+                  }
+                  if (Regex("\\b(date|day|today)\\b").containsMatchIn(s)) {
+                      val d = SimpleDateFormat("EEEE, MMMM d", Locale.getDefault()).format(Date())
+                      return Reply("It's $d. Wow, you really lost track of time, huh?")
+                  }
+                  if (Regex("hey google|assistant|ask google").containsMatchIn(s))
+                      return Reply("Fine, calling my smarter cousin. Don't tell him I sent you.") { openAssistant() }
+                  Regex("^(?:search|google|look up) (?:for )?(.+)").find(s)?.let {
+                      val q = it.groupValues[1]
+                      return Reply("Googling $q for you. Learn to do it yourself someday.") {
+                          go(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=" + Uri.encode(q))))
+                      }
+                  }
+                  if (s.contains("joke"))
+                      return Reply("Why did the phone go to therapy? Too many unresolved notifications. You're welcome.")
+                  if (s.contains("thank"))
+                      return Reply("Yeah yeah. Don't make it weird.")
+                  return Reply(listOf(
+                      "I have no idea what that means and I'm not paying you to explain it.",
+                      "Try again, but with words this time.",
+                      "Bold of you to assume I understood that."
+                  ).random())
+              }
+          }
+          EOF
+          cat > src/main/java/com/orin/james/JamesService.kt <<'EOF'
+          package com.orin.james
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.speech.RecognitionListener
+          import android.speech.RecognizerIntent
+          import android.speech.SpeechRecognizer
+          import android.speech.tts.TextToSpeech
+          import android.speech.tts.UtteranceProgressListener
+          import java.util.Locale
+
+          class JamesService : Service(), TextToSpeech.OnInitListener {
+              private lateinit var brain: Brain
+              private var sr: SpeechRecognizer? = null
+              private var tts: TextToSpeech? = null
+              private var speaking = false
+              private var pending: (() -> Unit)? = null
+              private val h = Handler(Looper.getMainLooper())
+              private val wake = Regex(
+                  "\\b(?:hey|hi|okay|ok|hay)\\s+(?:james|jame|jaymes|games|jeans)\\b[\\s,]*(.*)",
+                  RegexOption.IGNORE_CASE
+              )
+
+              override fun onBind(i: Intent?): IBinder? = null
+              override fun onStartCommand(i: Intent?, f: Int, id: Int) = START_STICKY
+
+              override fun onCreate() {
+                  super.onCreate()
+                  brain = Brain(this)
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("james", "James", NotificationManager.IMPORTANCE_LOW))
+                  val n = Notification.Builder(this, "james")
+                      .setContentTitle("James is listening")
+                      .setContentText("Say Hey James. Don't make me regret it.")
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                      .setOngoing(true).build()
+                  if (Build.VERSION.SDK_INT >= 29)
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+                  else startForeground(1, n)
+                  tts = TextToSpeech(this, this)
+              }
+
+              override fun onInit(status: Int) {
+                  tts?.language = Locale.US
+                  tts?.setPitch(0.8f)
+                  tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                      override fun onStart(id: String?) { h.post { speaking = true; sr?.cancel() } }
+                      override fun onDone(id: String?) { h.post { finishSpeaking() } }
+                      @Deprecated("Deprecated in Java")
+                      override fun onError(id: String?) { h.post { finishSpeaking() } }
+                  })
+                  speak(Reply("Ugh, I'm awake. Say Hey James if you need me."))
+              }
+
+              private fun finishSpeaking() {
+                  speaking = false
+                  pending?.invoke()
+                  pending = null
+                  listen()
+              }
+
+              private fun speak(r: Reply) {
+                  pending = r.after
+                  speaking = true
+                  tts?.speak(r.text, TextToSpeech.QUEUE_FLUSH, null, "j")
+              }
+
+              private val start = Runnable {
+                  if (speaking) return@Runnable
+                  sr?.destroy()
+                  sr = SpeechRecognizer.createSpeechRecognizer(this).apply {
+                      setRecognitionListener(object : RecognitionListener {
+                          override fun onResults(b: Bundle?) {
+                              val t = b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                              if (t != null) heard(t)
+                              if (!speaking) listen()
+                          }
+                          override fun onError(e: Int) { if (!speaking) listen() }
+                          override fun onReadyForSpeech(p: Bundle?) {}
+                          override fun onBeginningOfSpeech() {}
+                          override fun onRmsChanged(v: Float) {}
+                          override fun onBufferReceived(b: ByteArray?) {}
+                          override fun onEndOfSpeech() {}
+                          override fun onPartialResults(b: Bundle?) {}
+                          override fun onEvent(t: Int, b: Bundle?) {}
+                      })
+                      startListening(
+                          Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                              .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                              .putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+                      )
+                  }
+              }
+
+              private fun listen() {
+                  h.removeCallbacks(start)
+                  h.postDelayed(start, 500)
+              }
+
+              private fun heard(text: String) {
+                  val m = wake.find(text) ?: return
+                  val cmd = m.groupValues[1].trim()
+                  speak(if (cmd.isEmpty()) Reply(brain.wake()) else brain.reply(cmd))
+              }
+
+              override fun onDestroy() {
+                  h.removeCallbacksAndMessages(null)
+                  sr?.destroy()
+                  tts?.shutdown()
+                  super.onDestroy()
+              }
+          }
+          EOF
+          cat > src/main/java/com/orin/james/MainActivity.kt <<'EOF'
+          package com.orin.james
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val l = LinearLayout(this)
+                  l.orientation = LinearLayout.VERTICAL
+                  l.setPadding(48, 96, 48, 48)
+                  l.setBackgroundColor(Color.parseColor("#14110F"))
+                  val t = TextView(this)
+                  t.text = "James\nSet up once, then he listens in the background."
+                  t.setTextColor(Color.WHITE)
+                  t.textSize = 18f
+                  l.addView(t)
+                  fun btn(label: String, f: () -> Unit) {
+                      val x = Button(this)
+                      x.text = label
+                      x.setOnClickListener { f() }
+                      l.addView(x)
+                  }
+                  btn("1. Allow display over other apps") {
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + packageName)))
+                  }
+                  btn("2. Don't restrict battery") {
+                      startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                  }
+                  btn("3. Wake James") { start() }
+                  btn("Let James sleep") { stopService(Intent(this, JamesService::class.java)) }
+                  setContentView(l)
+              }
+
+              private fun start() {
+                  val need = mutableListOf(Manifest.permission.RECORD_AUDIO)
+                  if (Build.VERSION.SDK_INT >= 33) need.add(Manifest.permission.POST_NOTIFICATIONS)
+                  if (need.any { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED })
+                      requestPermissions(need.toTypedArray(), 1)
+                  else go()
+              }
+
+              override fun onRequestPermissionsResult(c: Int, p: Array<out String>, r: IntArray) {
+                  if (r.isNotEmpty() && r[0] == PackageManager.PERMISSION_GRANTED) go()
+              }
+
+              private fun go() { startForegroundService(Intent(this, JamesService::class.java)) }
+          }
+          EOF
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - name: Publish APK to Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp "$(find build/outputs/apk/debug -name '*.apk' | head -1)" james.apk
+          gh release delete latest --cleanup-tag -y || true
+          gh release create latest james.apk --title "James APK" --notes "Latest build"
